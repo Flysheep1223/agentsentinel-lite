@@ -1,14 +1,108 @@
 # AgentSentinel-Lite
 
-在工具调用后使用结构化运行指标预测最终失败风险，比较固定规则、Logistic Regression 与 KNN 的停止策略。
+**基于运行日志的 LLM Agent 失败预警与提前停止研究。**
 
-**当前完成第一步：任务结构、采集前分区、交叉验证和标签对齐。尚未完成正式采集准备。** Session 级 120 秒截止、12 次调用／30,000 Token 默认预算、总费用 B 与完整费用核算仍待下一步落实。不要把下面的真实模型命令视为已获准启动收费实验。
+AgentSentinel-Lite 研究工具调用过程中的结构化运行信号，能否在任务结束前预测失败，并在限制错误中断的前提下减少无效执行。项目比较固定规则、Logistic Regression 与 KNN，重点分析预测能力、预警时机和资源节省之间的取舍。
 
-`scripted` 是工程验证脚本，包含人为设置的循环、提前放弃和错误写入；其分数、估算 Token 和耗时不能作为真实 LLM 研究结论。本轮未调用付费 API。
+项目使用真实 LLM 在本地模拟工具环境中执行任务。工单、服务状态、工具及业务规则由代码构造，不连接真实业务系统；模型决策、API 调用和执行轨迹来自真实运行。实验结论应限定于当前模型、任务环境和故障设置。
 
-## 安装与本地验证
+## 研究问题
 
-所有 Python 命令使用项目 `.venv`，依赖由 `uv.lock` 固定。
+- 成功、失败及故障后恢复的运行，在工具错误、重试、重复调用和资源消耗上有何差异？
+- 这些信号是否在任务结束前已经出现，能否区分暂时受阻与最终失败？
+- 在相同的错误中断预算下，学习模型能否比固定规则更早识别失败，并降低执行成本？
+
+风险预测针对既定 Agent 策略和硬预算下的最终结果，不等同于判断任务已经不可恢复。提前停止也不意味着自动修复任务。
+
+## 当前进展
+
+已完成最小运行框架、模拟工具环境、故障注入、确定性验证器，以及采集前模板分区冻结。真实模型实验已完成独立的 **30 个 pilot Session 和 600 个正式 Session**。
+
+| 阶段 | 实际 Session | 分析有效 | 有效成功 | 有效失败 | 无效 | 模型请求 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pilot | 30 | 29 | 28 | 1 | 1 | 214 |
+| 正式采集 | 600 | 593 | 478 | 115 | 7 | 4,879 |
+
+一个 Session 是一次完整任务运行，通常包含多次模型请求与工具调用。600 个正式 Session 不等于 600 次 API 请求；无效运行保留原始记录，不混同于任务失败，也未通过补跑掩盖。
+
+本轮已知估算费用合计 **97.8892842 元人民币**，另有 5 次截止取消请求用量未知，不按零费用计算。该金额不含此前小规模试采，最终以供应商账单为准。
+
+- [完整采集报告](data/authorized_20261025_30plus600_v1/report.md)
+- [最终汇总与费用对账](data/authorized_20261025_30plus600_v1/summary.json)
+- [冻结实验配置](data/authorized_20261025_30plus600_v1/protocol.json)
+- [任务与分区设计](data/authorized_20261025_30plus600_v1/design.json)
+
+**尚未完成真实数据上的完整 EDA、预测模型训练与停止策略评价，也未执行独立在线对照。** 当前结果说明数据采集与审计已完成，不构成学习模型优于规则或已实现在线节省的证据。
+
+## 实验设计
+
+### 任务结构
+
+两个工作流各包含五个结构模板，每模板四个参数实例，共 10 个模板、40 个实例。模板差异影响信息依赖、条件分支与允许写入的对象，而不只是更换编号。
+
+| 工单模板 | 依赖结构 | 服务事件模板 | 依赖结构 |
+| --- | --- | --- | --- |
+| ticket-00 | 单工单→服务状态→更新原工单 | incident-00 | 单服务状态与策略→事件 |
+| ticket-01 | 原工单→关联工单→关联服务→写关联工单 | incident-01 | 服务→响应工单→关联服务→事件与工单备注 |
+| ticket-02 | 比较候选工单影响分→只修改胜者 | incident-02 | 比较候选服务严重程度和错误数→只处理胜者 |
+| ticket-03 | 按服务状态分支，必要时转向升级工单 | incident-03 | 健康时通知原服务，否则处理依赖服务 |
+| ticket-04 | 沿父工单链定位终点→只修改终点 | incident-04 | 汇总原服务及两个依赖→聚合事件 |
+
+Agent 仅接收公开任务、工具定义和已返回的工具结果，不接收隐藏初始状态、预期写入或验证器答案。
+
+### 故障与重复运行
+
+每个实例在正常、超时、限流、Schema 变化和部分响应五种条件下各运行三次：
+
+**10 模板 × 4 实例 × 5 条件 × 3 次重复 = 600 Session。**
+
+故障作用于读取工具，不直接指定成功或失败标签。故障条件不保证每条轨迹都触发故障；实际注入事件单独记录。当前超时和限流立即返回模拟错误，不模拟真实网络等待。
+
+正式实验中，409 个 Session 实际触发过故障，其中 316 个分析有效的运行最终成功。该观察描述当前模拟环境，不代表真实业务的恢复率。
+
+### 标签与分区
+
+验证器检查完成条件、完整写操作历史与最终状态。全部条件满足且无违规写入记为成功，否则失败；终止原因与任务结果独立记录。最后一次允许调用完成任务仍可成功，正常输出最终回复也可能任务失败。
+
+基础设施或协议异常导致的数据无效性单独标记，不直接作为失败训练标签。
+
+| 分区 | 模板数 | 计划 Session | 本轮分析有效 Session |
+| --- | ---: | ---: | ---: |
+| 训练 | 6 | 360 | 356 |
+| 验证 | 2 | 120 | 118 |
+| 测试 | 2 | 120 | 119 |
+
+同一模板的实例、故障条件、重复运行和全部前缀保持在同一分区。分区在采集前冻结，缺失或无效数据不触发重新分配。训练采用三个显式分组交叉验证折，每折留出两个工作流各一个训练模板。
+
+Pilot 使用六个预选训练模板各一个实例，在五种条件下各运行一次，不进入主数据集。本轮唯一无效 pilot 经单独审核后保留并排除，审核记录见 [pilot_review.json](data/authorized_20261025_30plus600_v1/pilot_review.json)。
+
+## 运行约束与计费
+
+本轮冻结配置如下；这是已执行实验的配置，不保证适用于其他供应商或模型。
+
+| 配置 | 本轮值 |
+| --- | --- |
+| 模型 | `kimi-k3-1-pro-261024` |
+| 接口 | 火山方舟 OpenAI-compatible Chat Completions |
+| 温度 | 1.0 |
+| 每 Session 工具调用上限 | 12 |
+| 每 Session 模型请求上限 | 24 |
+| 累计输入与输出 Token 阈值 | 30,000 |
+| Session 墙钟截止 | 120 秒 |
+| 单次输出 Token 上限 | 1,024 |
+| 自动 API 重试 | 0 |
+| 非缓存输入／缓存输入／输出单价 | 13／1.3／68 元每百万 Token |
+
+- HTTP 请求生命周期受剩余 Session 时间约束；流式响应不能绕过墙钟截止。
+- 累计 Token 按已返回 usage 检查，单次请求可能越过阈值，不是计费预授权。
+- Reasoning Token 属于输出子集，缓存 Token 属于输入子集，不重复累加。
+- 用量缺失不记零；费用区分已知与未知，包含无效运行已经产生的已知支出。
+- 本轮经用户授权不设金额上限；运行器不提供通用的总费用硬上限保证。
+- 正式采集有 56 次输出截断，已单独标记。分析时必须考虑固定输出上限对结果的影响，不得在看过测试结果后调整配置并混入同批数据。
+
+## 安装与离线验证
+
+依赖由 `uv.lock` 固定，所有 Python 命令使用项目 `.venv`。
 
 ```bash
 uv sync --python 3.12 --extra dev --frozen
@@ -17,79 +111,43 @@ uv sync --python 3.12 --extra dev --frozen
 .venv/bin/sentinel demo
 ```
 
-`demo` 先冻结设计，再执行 40 实例 × 五种条件 × 三次重复，共 600 个脚本 Session，随后加工数据、训练、选择阈值、回放并生成报告，无 API 请求。默认输出到新的 `data/demo_<时间>/`；用 `--output` 指定其他空目录。工程验证的临时产物不作为正式数据交付。
+`demo` 使用 `scripted` 后端，无真实 API 请求。它先冻结设计，再执行 600 个脚本 Session，随后加工数据、训练、选择阈值、回放并生成报告。默认输出到新的 `data/demo_<时间>/`，可用 `--output` 指定其他空目录。
 
-## 任务结构与标签
+**脚本后端仅用于工程验证。** 它包含人为设置的循环、提前放弃和错误写入，其分类分数、估算 Token 和耗时不能作为真实 LLM 研究结果。本轮采集实现的离线验证记录为 121 项测试通过，详见采集报告。
 
-两个工作流各五个结构模板，每模板四个参数实例，共 10 模板、40 实例。结构差异实际影响读取依赖与允许写入对象，不仅是操作组合或编号变化。
+## 接口配置与采集复现
 
-| 工单模板 | 依赖结构 | 服务事件模板 | 依赖结构 |
-| --- | --- | --- | --- |
-| ticket-00 | 单工单→服务状态→更新原工单 | incident-00 | 单服务状态与策略→事件 |
-| ticket-01 | 原工单→关联工单→关联服务→写关联工单 | incident-01 | 服务→响应工单→关联服务→事件与工单备注 |
-| ticket-02 | 读取两候选工单并比较影响分→只修改胜者 | incident-02 | 比较候选服务严重程度和错误数→只处理胜者 |
-| ticket-03 | 按原服务状态分支，必要时转向升级工单 | incident-03 | 健康时通知原服务，否则处理依赖服务 |
-| ticket-04 | 沿父工单链定位终点→只修改终点 | incident-04 | 汇总原服务和两个依赖的状态及策略→聚合事件 |
-
-真实 Agent 仅接收公开请求及工具结果，不接收初始状态、预期写入或最终验证结果。脚本后端同样从已观察响应解析依赖。
-
-标签由全部完成条件、完整写入历史和最终状态决定：全部满足且没有违规记成功，否则失败。终止原因独立记录；最后一次允许调用完成任务仍可成功，风险停止前已经完成也可成功。重复或非预期写入不能被最终状态恢复掩盖。基础设施无效运行单独排除，不直接作为任务失败训练样本。
-
-## 采集前冻结设计
-
-```bash
-.venv/bin/sentinel freeze --output data/design_001.json --seed 42
-```
-
-冻结文件包含完整任务目录、每工作流 3／1／1 模板的训练／验证／测试分区（合计 6／2／2）、三个显式 CV 留出折、pilot 和 online 的预选实例及指纹。每折留出两个工作流各一个训练模板。此时不冻结需在 pilot 后确定的模型配置与故障强度。
-
-- 设计文件不允许覆盖；采集前验证其指纹及与当前任务目录的一致性。
-- 每个训练模板预选排序首个实例，共 6 个 pilot 实例；每个测试模板预选前两个实例，共 4 个 online 实例。
-- 每批采集在提交 Session 前保存 `design.json`，实验清单及 Session 记录 `design_hash`。
-- 输出目录必须为空或仅含相同设计，拒绝混批与覆盖。
-- 数据加工复用冻结分区，模板缺数据只报告覆盖不足，不重新分配。
-- 旧版20模板日志、无设计哈希的历史日志不能混入新版数据。不要事后给旧日志补造预冻结记录。
-
-`tasks --output <路径>` 只导出任务目录，不替代 `freeze`。
-
-## 真实模型 pilot（预算控制完成后执行）
-
-在 `.env` 中配置接口、准确模型 ID 和价格，使用 `load_dotenv(override=True)`：
+真实接口通过本地 `.env` 配置，使用 `load_dotenv(override=True)`。不要将真实密钥提交到版本控制。
 
 ```dotenv
-OPENAI_BASE_URL=https://your-provider.example/v1
-OPENAI_API_KEY=your-key
-OPENAI_MODEL=your-model
-INPUT_PRICE_PER_MILLION=供应商输入单价
-OUTPUT_PRICE_PER_MILLION=供应商输出单价
+OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+OPENAI_API_KEY=replace-with-your-api-key
+OPENAI_MODEL=replace-with-your-model-id
+AGENT_TEMPERATURE=1
 ```
 
-支持 OpenAI-compatible Chat Completions SSE，要求工具调用、`parallel_tool_calls=false`、`stream_options.include_usage`；当前发送 `max_tokens`，供应商参数差异需先适配。密钥不写入日志。
+模型必须支持工具调用及流式 usage。不同供应商对参数、并行工具调用和推理模式的支持需要先验证；变量名为 `OPENAI_*` 不代表只能调用 OpenAI。
+
+本轮正式采集使用 [collection_run.py](src/agentsentinel/collection_run.py)，保存唯一计划、阶段 ledger、配置指纹和源码哈希，防止重复收费或覆盖实验。该入口专用于本轮协议，初始化会显式设置预算、人民币单价、并发及无金额上限配置，**不能当作读取任意 `.env` 价格的通用采集器**。
+
+复现前应审查入口及冻结配置，确认模型、计价、资源限制和新实验授权；使用新的独立目录，不覆盖已有数据。状态不确定的已启动请求不会自动重跑。原始协议与源码不一致时应新建实验，不通过修改旧快照绕过校验。
+
+通用设计冻结入口如下，仅生成任务设计，不发送模型请求：
 
 ```bash
-.venv/bin/sentinel collect \
-  --design data/design_001.json --backend openai --phase pilot \
-  --workers 2 --output data/pilot_001
+.venv/bin/sentinel freeze --output data/design_new.json --seed 42
 ```
 
-pilot 固定为 6 个预选训练实例 × 五条件 × 一次，共30次；数据不可进入正式训练。`--limit-tasks` 仅适用于 demo，不允许截取列表代替 pilot 选样。单独的小规模协议探测入口尚未实现。
+## 数据分析与停止策略
 
-Reasoning Token 属于供应商 completion Token 的一部分，不重复累加；缺少 reasoning/cache 保留缺失；缺少输入或输出 usage 时中止并排除该运行。缺少价格时成本为 `null`，使用 Token 作为资源代理。
+已有数据加工、简版 EDA、LR／KNN、固定规则及离线回放实现。分析流程使用训练集拟合预处理和选择模型参数，在验证集选择阈值，最终在测试集评价冻结策略。
 
-目前 Token 上限按已报告用量阻止下一次请求，并限制单次输出；本次请求仍可能因输入用量超限，不是账单预授权。现有费用汇总只覆盖有效分析运行，总费用核算及 B 控制仍待实现。
-
-## 正式实验流程（后续阶段）
-
-在训练模板 pilot 后冻结预算、故障强度和准确模型配置，核对总费用 B；分区及测试选样不根据结果调整。使用独立目录采集。
+**当前 CNY 采集字段与旧 USD 建模管线尚未全面对齐。** 人民币运行的 `cost_usd` 为 `null`，不能作为零成本；正式成本评价前需接入 `cost_cny`／`cost_estimate`、币种与最终对账记录。以下是分析入口示例，不表示这批真实数据已完成训练或评价。
 
 ```bash
-.venv/bin/sentinel collect \
-  --design data/design_001.json --backend openai --phase collection \
-  --workers 4 --fault-probability 0.7 --persistent-probability 0.3 \
-  --output data/collection_001
-
 .venv/bin/sentinel dataset \
-  --runs data/collection_001 --output artifacts/dataset_001
+  --runs data/authorized_20261025_30plus600_v1/collection \
+  --output artifacts/dataset_001
 
 .venv/bin/sentinel eda \
   --dataset artifacts/dataset_001 --output artifacts/eda_001
@@ -100,42 +158,27 @@ Reasoning Token 属于供应商 completion Token 的一部分，不重复累加�
 .venv/bin/sentinel evaluate \
   --dataset artifacts/dataset_001 --models artifacts/models_001 \
   --output artifacts/test_001
-
-.venv/bin/sentinel online \
-  --backend openai --models artifacts/models_001 \
-  --output data/online_001 --workers 4 --budget 0.05
 ```
 
-正式 collection 强制40实例、五条件、三次重复，共600次，拒绝 scripted 后端。计划训练／验证／测试分别360／120／120次；实际有效样本数另行报告。固定 CV 折缺模板或出现单类别时明确报错，不按标签重新分折。
+评价原则：
 
-online 复用冻结策略中的完整设计，仅用4个预选测试实例 × 五条件 × 两次重复 × 四策略，共160个新 Session，包含重新运行的完整基线。共享初始状态、故障规则和环境种子不能保证 LLM 轨迹相同。80次缩减及取消决策记录尚未实现；不得查看测试结果后临时改变选样。
+- 预测输入仅来自当前及过去事件，不包含故障配置、任务 ID、最终验证结果、未来长度或思维链。
+- 仅在仍可继续运行的位置评分；相关前缀不能视为独立任务样本。
+- 前缀分类指标与 Session 级首次告警指标分别报告；PR-AUC 使用 Average Precision。
+- 验证集考察 5%／10% 错误中断预算，允许选择永不停止策略；该预算不是部署保证，也不是 API 费用预算。
+- 同一步写入后告警不算违规操作前拦截；离线回放与独立在线效果不能混为一谈。
+- 删除 Token／成本特征不等于删除所有执行长度信息。
 
-验证集选择5%／10%错误中断预算下的阈值，测试只评价冻结策略。CLI 的 `--budget` 是错误中断率预算，不是 API 费用上限。
+后续重点是完成数据质量分析、固定步骤与分阶段 EDA、币种适配、模型及规则比较、消融和不确定性分析。独立在线对照需另行执行，当前没有在线节省结论。
 
-消融使用同一冻结数据：
+## 数据组织与研究边界
 
-```bash
-.venv/bin/sentinel train --dataset artifacts/dataset_001 \
-  --output artifacts/models_no_tokens --ablation no_tokens
-.venv/bin/sentinel train --dataset artifacts/dataset_001 \
-  --output artifacts/models_no_errors --ablation no_errors
-```
+每个 Session 保存 `events.jsonl`、`session.json`、`trajectory.json` 和 `result.json`。原始 SSE 响应体以 Base64 保存，可按模型请求事件回查；原始日志与分析表分开管理。
 
-分别通过 `evaluate` 评价。删除 Token／成本不等于删除全部长度信息；`no_errors` 同时移除错误计数、错误状态及重试计数。
+- [pilot 原始数据与阶段统计](data/authorized_20261025_30plus600_v1/pilot/)
+- [正式原始数据与阶段统计](data/authorized_20261025_30plus600_v1/collection/)
+- [此前五个独立试采 Session](sample_sessions_20261025_211146_823696/)
 
-## 数据与评价边界
+阶段汇总保留运行器原始统计。三个协议异常回复的 usage 在最终审计中由原始 SSE 恢复，追加对账保存在根目录汇总，未改写原始 Session 或有效性；**总费用以根目录 `summary.json` 为准**。
 
-- 四类故障为超时、限流、Schema变化和部分响应，作用于读取工具。超时／限流当前立即返回模拟错误，不模拟真实等待；写操作提交后返回超时不在当前范围。
-- 特征使用白名单，不含故障标签、任务 ID、未来长度、验证结果或思维链；Schema错误仅来自当时结构检查。
-- 每个 Session 训练前缀最多12个；验证／测试保留全部可继续位置，无前缀运行仍计入 Session 分母。
-- 自然终止以无工具调用的最终模型回复为准；验证器不在中途告知成功。耗尽已实现的步骤、Token、模型调用预算后不产生告警样本。
-- 首次告警按 Session 计算；同一步写入后告警不算违例前拦截。回放误中断与在线实际完成率分别报告。
-- PR-AUC 使用 Average Precision；阈值先满足误中断预算，再最小化成本或 Token，包含永不停止策略。
-- 当前 EDA 仅含故障失败率与 Token 箱线图简版；五类完整 EDA、逐模板报告、KNN规模耗时等仍待补齐。
-- 离线评分延迟为估计，在线记录特征提取和评分时间；成本使用统一输入／输出单价，未覆盖缓存折扣等完整供应商计费规则。
-
-每个 Session 保存 `events.jsonl`、`session.json`、`trajectory.json`、`result.json`。SSE 原始响应体以 Base64 保留；按 `llm_start`／`llm_end` 分隔重建。原始日志与 `prefixes.csv`／`sessions.csv` 分开保存。
-
-`split.json` 保存原设计与分析文件哈希；`policies.json` 保存原设计、模型、阈值、Agent配置和故障规则。加载时校验一致性。
-
-本轮进度与后续工作见 [实施状态](docs/IMPLEMENTATION_STATUS.md)。
+模拟工具故障不能覆盖真实系统的权限、陈旧数据和业务语义错误；两类工作流仍属于相近领域。测试集只有两个模板，不能由重复运行数量推断广泛泛化能力。停止策略的收益必须与误中断损失一起报告，不能只统计被停止运行节省的 Token。
