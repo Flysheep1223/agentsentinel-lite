@@ -45,6 +45,11 @@ class NotificationArgs(ServiceArgs):
 class ServiceResponse(BaseModel):
     service_id: str
     state: Literal["healthy", "degraded", "outage"]
+    error_count: int | None = None
+    response_ticket_id: str | None = None
+    related_service_ids: list[str] | None = None
+    dependency_service_id: str | None = None
+    dependency_service_ids: list[str] | None = None
 
 
 class PolicyResponse(BaseModel):
@@ -68,8 +73,16 @@ TOOL_SCHEMAS = [
     {"type": "function", "function": {
         "name": name,
         "description": {
-            "get_ticket": "Read a local ticket.",
-            "get_service_status": "Read live service state.",
+            "get_ticket": (
+                "Read a local ticket, its service_id and available relationships: "
+                "related_ticket_id, candidate_ticket_ids, escalation_ticket_id, "
+                "parent_ticket_id (null at root), and impact_score."
+            ),
+            "get_service_status": (
+                "Read live service state, error_count and available relationships: "
+                "response_ticket_id, related_service_ids, dependency_service_id "
+                "or dependency_service_ids."
+            ),
             "lookup_policy": "Read service recovery action and owner.",
             "update_ticket": "Change one field on a local ticket.",
             "append_note": "Append a note to a local ticket.",
@@ -151,7 +164,7 @@ class Environment:
             response = self._execute(tool, args)
             if tool in WRITE_TOOLS:
                 applied_write = True
-                self.writes.append({"step": step, "tool": tool, "arguments": args})
+                self.writes.append({"step": step, "tool": tool, "arguments": copy.deepcopy(args)})
             response, status, fault = self.injector.apply(tool, response)
             if status == "ok":
                 response_model = {
@@ -195,7 +208,7 @@ class Environment:
         return {"ok": True}
 
     def verify(self, termination: str) -> dict:
-        # Called only after termination; none of this evidence goes to the controller.
+        # 仅在终止后检查私有标准答案，不向控制器泄露验证证据。
         remaining = copy.deepcopy(self.task.expected_writes)
         violations = []
         for write in self.writes:
@@ -203,16 +216,17 @@ class Environment:
             if operation in remaining:
                 remaining.remove(operation)
             else:
-                violations.append({"step": write["step"], "reason": "unexpected_or_duplicate_write"})
+                violations.append({
+                    **copy.deepcopy(write), "reason": "unexpected_or_duplicate_write",
+                })
         expected = Environment(self.task, FaultConfig())
         for index, operation in enumerate(self.task.expected_writes, 1):
             expected.call(operation["tool"], operation["arguments"], index)
         state_matches = self.state == expected.state
         completed = not remaining and not violations and state_matches
-        budget_exhausted = termination in {"step_budget", "token_budget", "model_call_budget"}
-        success = completed and not budget_exhausted and termination in {"completed", "risk_stop"}
+        # 任务成败与终止原因正交；基础设施无效样本由 harness 单独隔离。
         return {
-            "success": success, "label": int(not success), "completed_conditions": completed,
+            "success": completed, "label": int(not completed), "completed_conditions": completed,
             "state_matches": state_matches, "missing_writes": remaining, "violations": violations,
             "first_violation_step": min((v["step"] for v in violations), default=None),
             "termination": termination,
