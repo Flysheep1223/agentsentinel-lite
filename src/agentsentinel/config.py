@@ -33,9 +33,12 @@ class Settings(BaseModel):
     model: str = ""
     base_url: str = "https://api.openai.com/v1"
     temperature: float = Field(default=0.2, ge=0, le=2)
-    max_steps: int = Field(default=18, ge=1)
+    max_steps: int = Field(default=12, ge=1)
     max_model_calls: int = Field(default=24, ge=1)
-    max_tokens: int = Field(default=24000, ge=1)
+    max_tokens: int = Field(default=30000, ge=1)
+    session_timeout: float = Field(default=120, gt=0)
+    currency: str = "USD"
+    cached_input_price: float | None = Field(default=None, ge=0)
     max_completion_tokens: int = Field(default=1024, ge=1)
     request_timeout: float = Field(default=60, gt=0)
     input_price: float | None = Field(default=None, ge=0)
@@ -54,13 +57,22 @@ class Settings(BaseModel):
             "max_tokens": "AGENT_MAX_TOKENS",
             "max_completion_tokens": "AGENT_MAX_COMPLETION_TOKENS",
             "request_timeout": "AGENT_REQUEST_TIMEOUT",
+            "session_timeout": "AGENT_SESSION_TIMEOUT",
+            "currency": "COST_CURRENCY",
+            "cached_input_price": "CACHED_INPUT_PRICE_PER_MILLION",
             "input_price": "INPUT_PRICE_PER_MILLION",
             "output_price": "OUTPUT_PRICE_PER_MILLION",
             "monitor_price_per_second": "MONITOR_PRICE_PER_SECOND",
         }
         return cls(**{k: os.environ[v] for k, v in mapping.items() if os.getenv(v)})
 
-    def cost(self, input_tokens: int | None, output_tokens: int | None) -> float | None:
+    def cost(self, input_tokens: int | None, output_tokens: int | None,
+             cached_tokens: int | None = None) -> float | None:
         if None in (self.input_price, self.output_price, input_tokens, output_tokens):
             return None
-        return (input_tokens * self.input_price + output_tokens * self.output_price) / 1e6
+        cached = cached_tokens if cached_tokens is not None else 0
+        cached_price = self.cached_input_price
+        if cached_price is None:
+            cached_price = self.input_price
+        return ((input_tokens - cached) * self.input_price
+                + cached * cached_price + output_tokens * self.output_price) / 1e6

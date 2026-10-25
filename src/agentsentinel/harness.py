@@ -7,7 +7,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Callable
 
-from .backends import BackendError, OpenAIBackend, ScriptedBackend
+from .backends import BackendError, OpenAIBackend, ScriptedBackend, SessionDeadline
 from .config import Settings, fingerprint, write_json
 from .environment import TOOL_SCHEMAS, Environment, FaultConfig
 from .features import FeatureBuilder
@@ -26,8 +26,10 @@ def run_session(
     task: Task, settings: Settings, faults: FaultConfig, output: Path,
     backend_name: str = "scripted", agent_seed: int = 0, phase: str = "demo",
     policy_name: str = "none", observer: Observer | None = None,
-    experiment_id: str = "", condition_id: str = "",
+    experiment_id: str = "", condition_id: str = "", design_hash: str = "",
 ) -> dict:
+    started = perf_counter()
+    deadline = started + settings.session_timeout
     if phase not in {"demo", "pilot", "collection", "online"}:
         raise ValueError("Unknown experiment phase")
     if (observer is None) != (policy_name == "none"):
@@ -41,13 +43,13 @@ def run_session(
     directory = output / session_id
     directory.mkdir(parents=True, exist_ok=False)
     metadata = {
-        "schema_version": 1, "session_id": session_id, "experiment_id": experiment_id,
+        "schema_version": 2, "session_id": session_id, "experiment_id": experiment_id,
         "condition_id": condition_id, "created_at": datetime.now(timezone.utc).isoformat(),
         "task_id": task.task_id, "template_id": task.template_id, "workflow": task.workflow,
         "task": task.model_dump(), "fault_config": faults.model_dump(),
         "agent_seed": agent_seed, "backend": backend_name, "phase": phase,
         "policy": policy_name, "settings": settings.model_dump(),
-        "config_hash": fingerprint(settings.model_dump()),
+        "config_hash": fingerprint(settings.model_dump()), "design_hash": design_hash,
         "token_source": "synthetic_estimate" if backend_name == "scripted" else "provider_usage",
     }
     write_json(directory / "session.json", metadata)
@@ -57,11 +59,14 @@ def run_session(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": task.public_request()},
     ]
-    started = perf_counter()
     totals = {
         "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
         "reasoning_tokens": None, "cached_tokens": None,
-        "cost_usd": None, "model_calls": 0, "tool_calls": 0,
+        "cost_usd": None, "cost_cny": None, "cost_estimate": None,
+        "currency": settings.currency, "model_calls": 0, "tool_calls": 0,
+        "known_input_tokens": 0, "known_output_tokens": 0,
+        "known_cost_estimate": 0.0, "unknown_usage_requests": 0,
+        "unknown_cache_requests": 0, "truncated_responses": 0,
     }
     optional_sums = {"reasoning_tokens": 0, "cached_tokens": 0}
     optional_complete = {"reasoning_tokens": True, "cached_tokens": True}
@@ -78,6 +83,9 @@ def run_session(
 
         record({"kind": "session_start", "session_id": session_id})
         while True:
+            if perf_counter() >= deadline:
+                termination = "time_budget"
+                break
             if totals["tool_calls"] >= settings.max_steps:
                 termination = "step_budget"
                 break
@@ -91,45 +99,74 @@ def run_session(
             record({"kind": "llm_start", "model_call": totals["model_calls"]})
             llm_started = perf_counter()
             try:
-                completion = backend.complete(
-                    messages, TOOL_SCHEMAS, record,
-                    settings.max_tokens - totals["total_tokens"],
-                )
+                args = (messages, TOOL_SCHEMAS, record,
+                        settings.max_tokens - totals["total_tokens"])
+                completion = (backend.complete(*args, deadline - perf_counter())
+                              if backend_name == "openai" else backend.complete(*args))
             except BackendError as exc:
-                valid, termination, failure_detail = False, "backend_error", str(exc)
+                valid = False
+                termination = "time_budget" if isinstance(exc, SessionDeadline) else "backend_error"
+                failure_detail = str(exc)
+                totals["unknown_usage_requests"] += 1
+                for key in ("input_tokens", "output_tokens", "total_tokens", "cost_estimate",
+                            "cost_usd", "cost_cny"):
+                    totals[key] = None
                 record({"kind": "backend_error", "message": failure_detail})
                 break
             llm_ms = (perf_counter() - llm_started) * 1000
-            missing_usage = completion.input_tokens is None or completion.output_tokens is None
-            if missing_usage:
-                # A missing usage field is never interpreted as free inference.
-                for key in ("input_tokens", "output_tokens", "total_tokens", "cost_usd"):
+            usage = {key: getattr(completion, key) for key in (
+                "input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
+            )}
+            missing_usage = any(usage[key] is None for key in ("input_tokens", "output_tokens"))
+            invalid_usage = any(value is not None and (type(value) is not int or value < 0)
+                                for value in usage.values())
+            if not missing_usage and not invalid_usage:
+                invalid_usage = (
+                    (completion.cached_tokens or 0) > completion.input_tokens
+                    or (completion.reasoning_tokens or 0) > completion.output_tokens
+                )
+            if missing_usage or invalid_usage:
+                totals["unknown_usage_requests"] += 1
+                for key in ("input_tokens", "output_tokens", "total_tokens", "cost_estimate",
+                            "cost_usd", "cost_cny"):
                     totals[key] = None
             else:
-                totals["input_tokens"] += completion.input_tokens
-                totals["output_tokens"] += completion.output_tokens
+                for key in ("input_tokens", "output_tokens"):
+                    totals[key] += usage[key]
+                    totals["known_" + key] += usage[key]
                 totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
-                totals["cost_usd"] = settings.cost(totals["input_tokens"], totals["output_tokens"])
-            for key in optional_sums:
-                value = getattr(completion, key)
-                optional_complete[key] &= value is not None
-                if value is not None:
-                    optional_sums[key] += value
-                totals[key] = optional_sums[key] if optional_complete[key] else None
+                cost = settings.cost(completion.input_tokens, completion.output_tokens,
+                                     completion.cached_tokens)
+                if cost is not None:
+                    totals["known_cost_estimate"] += cost
+                    totals["cost_estimate"] = totals["known_cost_estimate"]
+                    totals["cost_" + settings.currency.lower()] = totals["cost_estimate"]
+                totals["unknown_cache_requests"] += int(completion.cached_tokens is None)
+                for key in optional_sums:
+                    value = usage[key]
+                    optional_complete[key] &= value is not None
+                    if value is not None:
+                        optional_sums[key] += value
+                    totals[key] = optional_sums[key] if optional_complete[key] else None
             message = completion.message
+            totals["truncated_responses"] += int(completion.finish_reason == "length")
             record({
                 "kind": "llm_end", "model_call": totals["model_calls"],
                 "message": message, "latency_ms": llm_ms, "totals": dict(totals),
-                "usage": {
-                    "input_tokens": completion.input_tokens,
-                    "output_tokens": completion.output_tokens,
-                    "reasoning_tokens": completion.reasoning_tokens,
-                    "cached_tokens": completion.cached_tokens,
-                },
+                "usage": usage, "finish_reason": completion.finish_reason,
             })
             messages.append(message)
-            if missing_usage:
-                valid, termination = False, "missing_usage"
+            if missing_usage or invalid_usage:
+                valid, termination = False, "missing_usage" if missing_usage else "invalid_usage"
+                break
+            if perf_counter() >= deadline:
+                termination = "time_budget"
+                break
+            if completion.finish_reason == "length":
+                termination = "output_truncated"
+                break
+            if backend_name == "openai" and completion.finish_reason not in {"stop", "tool_calls"}:
+                valid, termination = False, "invalid_finish_reason"
                 break
             if totals["total_tokens"] >= settings.max_tokens:
                 termination = "token_budget"
@@ -142,8 +179,10 @@ def run_session(
                 if not isinstance(arguments, dict):
                     raise ValueError("Tool arguments must be an object")
             except (json.JSONDecodeError, ValueError):
-                # Malformed arguments are agent errors visible to the recovery loop.
                 arguments = {"__invalid_json__": call["function"]["arguments"]}
+            if perf_counter() >= deadline:
+                termination = "time_budget"
+                break
             totals["tool_calls"] += 1
             event = environment.call(call["function"]["name"], arguments, totals["tool_calls"])
             fault = event.pop("fault")
@@ -153,6 +192,7 @@ def run_session(
                 totals["tool_calls"] < settings.max_steps
                 and totals["model_calls"] < settings.max_model_calls
                 and totals["total_tokens"] < settings.max_tokens
+                and perf_counter() < deadline
             )
             event.update({
                 "kind": "tool_end", "step": totals["tool_calls"],
@@ -181,14 +221,21 @@ def run_session(
                 if decision["stop"]:
                     termination = "risk_stop"
                     break
+        totals["cost_status"] = (
+            "incomplete_usage" if totals["unknown_usage_requests"] else
+            "unknown_price" if totals["cost_estimate"] is None else
+            "full_input_estimate_cache_unknown" if totals["unknown_cache_requests"] else
+            "usage_priced"
+        )
         result = environment.verify(termination)
         result.update({
-            "schema_version": 1, "session_id": session_id, "valid_for_analysis": valid,
+            "schema_version": 2, "session_id": session_id, "valid_for_analysis": valid,
             "failure_detail": failure_detail, "totals": totals,
             "elapsed_ms": (perf_counter() - started) * 1000,
             "feature_extraction_ms": extraction_ms, "model_scoring_ms": monitor_ms,
-            "monitor_cost_usd": (extraction_ms + monitor_ms) / 1000
-            * settings.monitor_price_per_second,
+            "monitor_cost_usd": ((extraction_ms + monitor_ms) / 1000
+                                 * settings.monitor_price_per_second
+                                 if settings.currency == "USD" else None),
         })
         record({"kind": "session_end", "result": result})
     write_json(directory / "trajectory.json", {

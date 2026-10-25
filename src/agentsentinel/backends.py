@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -10,13 +11,17 @@ from typing import Callable
 import httpx
 
 from .config import Settings
-from .tasks import intended_writes
+from .tasks import SEVERITY, aggregate_writes, intended_writes
 
 Recorder = Callable[[dict], None]
 
 
 class BackendError(RuntimeError):
     """Transport/protocol failure, excluded from tool-failure training data."""
+
+
+class SessionDeadline(BackendError):
+    pass
 
 
 @dataclass
@@ -26,6 +31,7 @@ class Completion:
     output_tokens: int | None
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None
+    finish_reason: str | None = "stop"
 
 
 class ScriptedBackend:
@@ -36,51 +42,149 @@ class ScriptedBackend:
     def __init__(self, seed: int):
         self.random = random.Random(seed)
         self.calls = 0
-        # Seeded imperfect behavior exercises both classes even without injected errors.
+        # 带种子的非理想行为仅用于工程验证，不代表真实模型表现。
         self.behavior = self.random.choice(["normal"] * 6 + ["give_up", "repeat", "wrong_write"])
+
+    @staticmethod
+    def _plan(request: dict, observed: dict):
+        # 每次从公开请求和已观察响应重建计划，不访问任务私有状态或标准答案。
+        def read(tool: str, object_id: str, fields: tuple[str, ...] = ()):
+            id_field = "ticket_id" if tool == "get_ticket" else "service_id"
+            response = observed.get((tool, object_id), {})
+            if (response.get(id_field) != object_id
+                    or any(field not in response or response[field] is None for field in fields)):
+                yield {"tool": tool, "arguments": {id_field: object_id}}
+            return response
+
+        def ticket(tid: str, fields: tuple[str, ...] = ()):
+            return (yield from read("get_ticket", tid, ("service_id", *fields)))
+
+        def service(sid: str, fields: tuple[str, ...] = ()):
+            return (yield from read("get_service_status", sid, ("state", *fields)))
+
+        def policy(sid: str):
+            return (yield from read("lookup_policy", sid, ("action", "owner")))
+
+        tid, sid = request["ticket_id"], request["service_id"]
+        structure, goals = request["structure"], request["goals"]
+        if request["workflow"] == "ticket":
+            root_fields = {
+                "linked": ("related_ticket_id",), "compare": ("candidate_ticket_ids",),
+                "branch": ("escalation_ticket_id",),
+            }.get(structure, ())
+            target = yield from ticket(tid, root_fields)
+            if structure == "linked":
+                tid = target["related_ticket_id"]
+                target = yield from ticket(tid)
+            elif structure == "compare":
+                candidates = []
+                for candidate_id in target["candidate_ticket_ids"]:
+                    candidates.append((yield from ticket(candidate_id, ("impact_score",))))
+                target = min(candidates, key=lambda t: (-t["impact_score"], t["ticket_id"]))
+                tid = target["ticket_id"]
+            elif structure == "branch":
+                root_service = yield from service(target["service_id"])
+                if root_service["state"] == "healthy":
+                    goals = ["status"]
+                else:
+                    tid, goals = target["escalation_ticket_id"], ["owner", "note"]
+                    target = yield from ticket(tid)
+            elif structure == "chain":
+                while True:
+                    if "parent_ticket_id" not in target:
+                        yield {"tool": "get_ticket", "arguments": {"ticket_id": tid}}
+                    parent = target["parent_ticket_id"]
+                    if parent is None:
+                        break
+                    tid = parent
+                    target = yield from ticket(tid)
+            sid = target["service_id"]
+            selected = yield from service(sid)
+        else:
+            root_fields = {
+                "linked": ("response_ticket_id",), "compare": ("related_service_ids",),
+                "branch": ("dependency_service_id",), "aggregate": ("dependency_service_ids",),
+            }.get(structure, ())
+            selected = yield from service(sid, root_fields)
+            if structure == "linked":
+                tid = selected["response_ticket_id"]
+                target = yield from ticket(tid)
+                sid = target["service_id"]
+                selected = yield from service(sid)
+            elif structure == "compare":
+                candidates = []
+                for candidate_id in selected["related_service_ids"]:
+                    candidates.append((yield from service(candidate_id, ("error_count",))))
+                selected = min(candidates, key=lambda s: (
+                    -SEVERITY[s["state"]], -s["error_count"], s["service_id"],
+                ))
+                sid = selected["service_id"]
+            elif structure == "branch":
+                if selected["state"] == "healthy":
+                    goals = ["notify"]
+                else:
+                    sid = selected["dependency_service_id"]
+                    selected = yield from service(sid)
+            elif structure == "aggregate":
+                services = [selected]
+                for dependency in selected["dependency_service_ids"]:
+                    services.append((yield from service(dependency)))
+                policies = {}
+                for item in services:
+                    policies[item["service_id"]] = yield from policy(item["service_id"])
+                yield from aggregate_writes(sid, services, policies)
+                return
+        selected_policy = {}
+        if any(goal in {"owner", "note", "incident", "notify"} for goal in goals):
+            selected_policy = yield from policy(sid)
+        yield from intended_writes(goals, tid, sid, selected["state"], selected_policy)
 
     def complete(self, messages: list[dict], tools: list[dict], record: Recorder,
                  remaining_tokens: int) -> Completion:
         self.calls += 1
-        request = json.loads(messages[1]["content"])
-        observed: dict[str, dict] = {}
+        request = json.loads(next(msg["content"] for msg in messages if msg["role"] == "user"))
+        observed: dict[tuple[str, str], dict] = {}
         successful_writes = []
-        last_call = None
+        calls = {}
         failures = 0
         for msg in messages:
-            if msg["role"] == "assistant" and msg.get("tool_calls"):
-                last_call = msg["tool_calls"][0]["function"]
-            elif msg["role"] == "tool" and last_call:
+            if msg["role"] == "assistant":
+                for call in msg.get("tool_calls", []):
+                    calls[call["id"]] = call["function"]
+            elif msg["role"] == "tool" and msg.get("tool_call_id") in calls:
+                call = calls[msg["tool_call_id"]]
                 response = json.loads(msg["content"])
+                arguments = json.loads(call["arguments"])
                 if response.get("error"):
                     failures += 1
                 elif response.get("ok"):
-                    successful_writes.append({
-                        "tool": last_call["name"],
-                        "arguments": json.loads(last_call["arguments"]),
-                    })
+                    successful_writes.append({"tool": call["name"], "arguments": arguments})
                 else:
-                    observed[last_call["name"]] = response
+                    object_id = arguments.get("ticket_id", arguments.get("service_id"))
+                    observed[(call["name"], object_id)] = response
+        # 按完整操作匹配成功写入，不能把另一个对象的成功响应当成当前操作完成。
+        remaining_successes = list(successful_writes)
         operation = None
-        if request["workflow"] == "ticket" and "get_ticket" not in observed:
-            operation = {"tool": "get_ticket", "arguments": {"ticket_id": request["ticket_id"]}}
-        elif "get_service_status" not in observed:
-            operation = {
-                "tool": "get_service_status", "arguments": {"service_id": request["service_id"]},
-            }
-        elif not all(observed.get("lookup_policy", {}).get(key) for key in ("action", "owner")):
-            operation = {"tool": "lookup_policy", "arguments": {"service_id": request["service_id"]}}
-        else:
-            plan = intended_writes(
-                request["goals"], request["ticket_id"], request["service_id"],
-                observed["get_service_status"]["state"], observed["lookup_policy"],
-            )
-            if len(successful_writes) < len(plan):
-                operation = plan[len(successful_writes)]
-                if self.behavior == "wrong_write" and operation["tool"] == "update_ticket":
-                    operation = {"tool": "update_ticket", "arguments": {
-                        **operation["arguments"], "ticket_id": "T-decoy",
-                    }}
+        for candidate in self._plan(request, observed):
+            if candidate in remaining_successes:
+                remaining_successes.remove(candidate)
+            else:
+                operation = candidate
+                break
+        if self.behavior == "wrong_write" and operation:
+            arguments = operation["arguments"]
+            if operation["tool"] in {"update_ticket", "append_note"}:
+                operation = {"tool": operation["tool"], "arguments": {
+                    **arguments, "ticket_id": "T-decoy",
+                }}
+            elif operation["tool"] == "record_incident":
+                operation = {"tool": operation["tool"], "arguments": {
+                    **arguments, "action": "incorrect-action",
+                }}
+            elif operation["tool"] == "send_notification":
+                operation = {"tool": operation["tool"], "arguments": {
+                    **arguments, "body": "incorrect-notification",
+                }}
         if self.behavior == "repeat" and self.calls > 3:
             operation = {
                 "tool": "get_service_status", "arguments": {"service_id": request["service_id"]},
@@ -96,7 +200,7 @@ class ScriptedBackend:
                     "arguments": json.dumps(operation["arguments"], sort_keys=True),
                 }}],
             }
-        # Estimated counts are explicitly synthetic in session metadata.
+        # 合成计数在会话元数据中明确标记，不用作真实模型测量。
         input_tokens = max(1, len(json.dumps(messages)) // 4)
         output_tokens = max(1, len(json.dumps(message)) // 4)
         record({"kind": "scripted_response", "message": message})
@@ -115,7 +219,11 @@ class OpenAIBackend:
             raise ValueError("请在项目 .env 配置 OPENAI_API_KEY 和 OPENAI_MODEL。")
 
     def complete(self, messages: list[dict], tools: list[dict], record: Recorder,
-                 remaining_tokens: int) -> Completion:
+                 remaining_tokens: int, remaining_seconds: float | None = None) -> Completion:
+        return asyncio.run(self._complete(messages, tools, record, remaining_tokens,
+                                         remaining_seconds or self.settings.session_timeout))
+
+    async def _complete(self, messages, tools, record, remaining_tokens, remaining_seconds):
         cfg = self.settings
         payload = {
             "model": cfg.model, "messages": messages, "tools": tools,
@@ -125,17 +233,26 @@ class OpenAIBackend:
         }
         # No automatic API retries: every invocation and failure remains observable.
         try:
-            with httpx.Client(timeout=cfg.request_timeout) as client:
-                with client.stream(
-                    "POST", cfg.base_url.rstrip("/") + "/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    json=payload,
-                ) as response:
-                    if response.status_code >= 400:
-                        # Do not print response bodies, request headers, or credentials.
-                        raise BackendError(f"LLM HTTP {response.status_code}")
-                    return self._consume(response.iter_bytes(), record)
-        except (httpx.HTTPError, UnicodeError, json.JSONDecodeError) as exc:
+            async with asyncio.timeout(remaining_seconds):
+                async with httpx.AsyncClient(
+                    timeout=min(cfg.request_timeout, remaining_seconds),
+                ) as client:
+                    async with client.stream(
+                        "POST", cfg.base_url.rstrip("/") + "/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}"}, json=payload,
+                    ) as response:
+                        if response.status_code >= 400:
+                            raise BackendError(f"LLM HTTP {response.status_code}")
+                        chunks = []
+                        async for chunk in response.aiter_bytes():
+                            record({"kind": "llm_sse", "body_base64":
+                                    base64.b64encode(chunk).decode("ascii")})
+                            chunks.append(chunk)
+                        return self._consume(chunks, lambda event: None)
+        except TimeoutError:
+            raise SessionDeadline("Session wall-clock deadline during HTTP request") from None
+        except (httpx.HTTPError, UnicodeError, json.JSONDecodeError,
+                KeyError, TypeError, AttributeError, ValueError) as exc:
             raise BackendError(f"LLM transport/protocol error: {type(exc).__name__}") from None
 
     @staticmethod
@@ -146,9 +263,10 @@ class OpenAIBackend:
         calls: dict[int, dict] = {}
         usage: dict = {}
         done = False
+        finish_reason = None
 
         def dispatch() -> None:
-            nonlocal usage, done
+            nonlocal usage, done, finish_reason
             if not data_lines:
                 return
             raw = b"\n".join(data_lines)
@@ -164,6 +282,8 @@ class OpenAIBackend:
             for choice in event.get("choices", []):
                 if choice.get("index", 0) != 0:
                     raise BackendError("Multiple completion choices are unsupported")
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
                 delta = choice.get("delta", {})
                 if delta.get("content"):
                     content.append(delta["content"])
@@ -199,7 +319,9 @@ class OpenAIBackend:
         message = {"role": "assistant", "content": "".join(content) or None}
         if calls:
             ordered = [calls[index] for index in sorted(calls)]
-            if any(not c["id"] or not c["function"]["name"] for c in ordered):
+            if finish_reason != "length" and any(
+                not c["id"] or not c["function"]["name"] for c in ordered
+            ):
                 raise BackendError("Incomplete streamed tool call")
             message["tool_calls"] = ordered
         return Completion(
@@ -208,4 +330,5 @@ class OpenAIBackend:
             output_tokens=usage.get("completion_tokens"),
             reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
             cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+            finish_reason=finish_reason,
         )
