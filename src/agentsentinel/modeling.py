@@ -11,13 +11,13 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
+from sklearn.model_selection import GridSearchCV
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from .config import fingerprint, read_json, write_json
-from .dataset import load_dataset
+from .dataset import load_dataset, validate_design
 from .evaluation import (
     bootstrap_intervals,
     choose_threshold,
@@ -113,9 +113,22 @@ def train_models(
     prefixes, sessions, manifest = load_dataset(dataset)
     if manifest["phase"] not in {"demo", "collection"}:
         raise ValueError("试运行数据不能进入正式训练；仅接受 demo 或 collection 数据。")
-    training = capped_training_rows(prefixes[prefixes.split == "train"], max_prefixes)
+    design = manifest["design"]
+    training_prefixes = prefixes[prefixes.split == "train"]
+    expected_templates = {
+        name for name, split in design["assignments"].items() if split == "train"
+    }
+    observed_templates = set(training_prefixes.template_id)
+    missing_templates = sorted(expected_templates - observed_templates)
+    if missing_templates:
+        raise ValueError(f"冻结训练模板缺少可用前缀数据：{', '.join(missing_templates)}")
+    if observed_templates != expected_templates:
+        raise ValueError("训练数据包含冻结训练分区之外的模板。")
+    training = capped_training_rows(training_prefixes, max_prefixes)
     validation = prefixes[prefixes.split == "validation"]
     validation_sessions = sessions[sessions.split == "validation"]
+    if validation.empty:
+        raise ValueError("冻结验证分区没有可用决策前缀。")
     if training.label.nunique() != 2 or not (validation_sessions.label == 0).any():
         raise ValueError("训练集需要成功和失败样本，验证集至少需要成功 Session。")
     columns = list(FEATURE_COLUMNS)
@@ -125,16 +138,24 @@ def train_models(
         columns = [c for c in columns if "error" not in c and c not in {"status", "retry_count"}]
     elif ablation != "none":
         raise ValueError("Unknown ablation")
-    groups = training.template_id
-    n_splits = min(3, groups.nunique())
-    if n_splits < 2:
-        raise ValueError("训练集需要至少两个独立模板。")
-    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    folds = list(splitter.split(training[columns], training.label, groups))
-    if any(training.iloc[tr].label.nunique() != 2 or training.iloc[va].label.nunique() != 2
-           for tr, va in folds):
-        raise ValueError("分组交叉验证存在单一类别折；需要更多独立模板或重新设计试运行。")
+    folds = []
+    # 仅将冻结的留出模板映射到抽样后的行位置，不根据标签重新分折。
+    for index, held_out in enumerate(design["cv_folds"], 1):
+        held_out_mask = training.template_id.isin(held_out).to_numpy()
+        train_indices = np.flatnonzero(~held_out_mask)
+        validation_indices = np.flatnonzero(held_out_mask)
+        if not len(train_indices) or not len(validation_indices):
+            raise ValueError(f"冻结交叉验证第 {index} 折缺少训练或留出数据。")
+        if (
+            training.iloc[train_indices].label.nunique() != 2
+            or training.iloc[validation_indices].label.nunique() != 2
+        ):
+            raise ValueError(f"冻结交叉验证第 {index} 折存在单一类别；不能重新分折。")
+        folds.append((train_indices, validation_indices))
     smallest_fold = min(len(tr) for tr, _ in folds)
+    neighbor_counts = [k for k in [3, 5, 9] if k <= smallest_fold]
+    if not neighbor_counts:
+        raise ValueError("冻结交叉验证训练折样本不足，无法使用预设 KNN 邻居数。")
     definitions = {
         "logistic": (
             LogisticRegression(max_iter=2000, random_state=seed),
@@ -142,13 +163,13 @@ def train_models(
         ),
         "knn": (
             KNeighborsClassifier(),
-            {"model__n_neighbors": [k for k in [3, 5, 9] if k <= smallest_fold],
+            {"model__n_neighbors": neighbor_counts,
              "model__weights": ["uniform", "distance"]},
         ),
     }
     output.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "schema_version": 1, "dataset_fingerprint": manifest["fingerprint"],
+        "schema_version": 2, "dataset_fingerprint": manifest["fingerprint"],
         "phase": manifest["phase"], "backend": manifest["backend"],
         "config_hash": manifest["config_hash"], "seed": seed, "ablation": ablation,
         "columns": columns, "max_training_prefixes_per_session": max_prefixes,
@@ -156,6 +177,7 @@ def train_models(
         "training_templates": training.template_id.nunique(), "models": {},
         "monitor_price_per_second": manifest["monitor_price_per_second"],
         "template_assignments": manifest["assignments"],
+        "design": design, "design_hash": design["fingerprint"],
         "fault_design": manifest["fault_design"],
         "fault_conditions": manifest["fault_conditions"],
     }
@@ -206,6 +228,11 @@ def read_policies(models: Path) -> dict:
     policies = read_json(models / "policies.json")
     if fingerprint({k: v for k, v in policies.items() if k != "freeze_hash"}) != policies["freeze_hash"]:
         raise ValueError("停止策略配置已在冻结后改变。")
+    design = validate_design(policies.get("design"))
+    if policies.get("design_hash") != design["fingerprint"]:
+        raise ValueError("策略 design_hash 与冻结设计不一致。")
+    if policies.get("template_assignments") != design["assignments"]:
+        raise ValueError("策略模板分区与冻结设计不一致。")
     for name in ("logistic", "knn"):
         if hashlib.sha256((models / f"{name}.joblib").read_bytes()).hexdigest() != (
             policies["models"][name]["file_sha256"]
