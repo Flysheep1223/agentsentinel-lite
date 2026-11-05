@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -140,7 +141,7 @@ class ScriptedBackend:
         yield from intended_writes(goals, tid, sid, selected["state"], selected_policy)
 
     def complete(self, messages: list[dict], tools: list[dict], record: Recorder,
-                 remaining_tokens: int) -> Completion:
+                 remaining_tokens: int | None) -> Completion:
         self.calls += 1
         request = json.loads(next(msg["content"] for msg in messages if msg["role"] == "user"))
         observed: dict[tuple[str, str], dict] = {}
@@ -219,23 +220,28 @@ class OpenAIBackend:
             raise ValueError("请在项目 .env 配置 OPENAI_API_KEY 和 OPENAI_MODEL。")
 
     def complete(self, messages: list[dict], tools: list[dict], record: Recorder,
-                 remaining_tokens: int, remaining_seconds: float | None = None) -> Completion:
+                 remaining_tokens: int | None, remaining_seconds: float | None = None) -> Completion:
         return asyncio.run(self._complete(messages, tools, record, remaining_tokens,
-                                         remaining_seconds or self.settings.session_timeout))
+                                         remaining_seconds))
 
     async def _complete(self, messages, tools, record, remaining_tokens, remaining_seconds):
         cfg = self.settings
         payload = {
             "model": cfg.model, "messages": messages, "tools": tools,
             "parallel_tool_calls": False, "temperature": cfg.temperature,
-            "max_tokens": min(cfg.max_completion_tokens, remaining_tokens),
             "stream": True, "stream_options": {"include_usage": True},
         }
+        limits = [limit for limit in (cfg.max_completion_tokens, remaining_tokens)
+                  if limit is not None]
+        if limits:
+            payload["max_tokens"] = min(limits)
         # No automatic API retries: every invocation and failure remains observable.
         try:
-            async with asyncio.timeout(remaining_seconds):
+            async with (asyncio.timeout(remaining_seconds)
+                        if remaining_seconds is not None else nullcontext()):
                 async with httpx.AsyncClient(
-                    timeout=min(cfg.request_timeout, remaining_seconds),
+                    timeout=(cfg.request_timeout if remaining_seconds is None
+                             else min(cfg.request_timeout, remaining_seconds)),
                 ) as client:
                     async with client.stream(
                         "POST", cfg.base_url.rstrip("/") + "/chat/completions",

@@ -221,3 +221,100 @@ def test_ambiguous_started_attempt_is_not_retried(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="Paused"):
         collection_run.run_phase(root, "pilot")
     stub.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "session_timeout", "max_completion_tokens"])
+def test_optional_budgets_null_roundtrip_and_invalid_values(field):
+    cfg = Settings(**{field: None})
+    assert json.loads(cfg.model_dump_json())[field] is None
+    assert Settings.model_validate_json(cfg.model_dump_json()) == cfg
+    for invalid in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            Settings(**{field: invalid})
+
+
+@pytest.mark.parametrize("output_limit,remaining,expected", [
+    (None, None, None), (None, 73, 73), (1024, None, 1024), (1024, 73, 73),
+])
+def test_optional_payload_and_network_timeout(monkeypatch, output_limit, remaining, expected):
+    captured = []
+    body = ('data: ' + json.dumps({"choices": [{"delta": {"content": "done"},
+                                               "finish_reason": "stop"}],
+                                  "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+            + '\n\ndata: [DONE]\n\n').encode()
+
+    def respond(request):
+        captured.append(json.loads(request.content))
+        assert request.extensions["timeout"] == dict.fromkeys(("connect", "read", "write", "pool"), 60)
+        return httpx.Response(200, content=body)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr("agentsentinel.backends.httpx.AsyncClient", lambda **kwargs:
+                        real_client(transport=httpx.MockTransport(respond), **kwargs))
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-placeholder")
+    monkeypatch.setattr("agentsentinel.backends.asyncio.timeout", Mock(
+        side_effect=AssertionError("No session timeout may be installed"),
+    ))
+    backend = OpenAIBackend(Settings(model="offline", session_timeout=None,
+                                     max_completion_tokens=output_limit))
+    assert backend.complete([], [], lambda event: None, remaining, None).output_tokens == 5
+    assert len(captured) == 1
+    if expected is None:
+        assert "max_tokens" not in captured[0]
+    else:
+        assert captured[0]["max_tokens"] == expected
+
+
+def test_network_timeout_remains_effective_without_session_deadline(monkeypatch):
+    from agentsentinel.backends import BackendError
+
+    attempts = []
+
+    def timeout(request):
+        attempts.append(request)
+        assert request.extensions["timeout"]["read"] == 60
+        raise httpx.ReadTimeout("isolated timeout")
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr("agentsentinel.backends.httpx.AsyncClient", lambda **kwargs:
+                        real_client(transport=httpx.MockTransport(timeout), **kwargs))
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-placeholder")
+    with pytest.raises(BackendError, match="ReadTimeout"):
+        OpenAIBackend(Settings(model="offline", session_timeout=None)).complete(
+            [], [], lambda event: None, None, None,
+        )
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("limit,termination,expected_calls", [
+    ({"max_steps": 2}, "step_budget", 2),
+    ({"max_model_calls": 2}, "model_call_budget", 2),
+])
+def test_unlimited_budgets_keep_step_and_call_limits(tmp_path, monkeypatch, limit,
+                                                   termination, expected_calls):
+    call = {"role": "assistant", "tool_calls": [{"id": "one", "function": {
+        "name": "get_ticket", "arguments": json.dumps({"ticket_id": make_tasks()[0].ticket_id}),
+    }}]}
+    backend = fake_backend(monkeypatch, [Completion(call, 100000, 2000, finish_reason="tool_calls")
+                                       for _ in range(expected_calls)])
+    settings = Settings(max_tokens=None, session_timeout=None, max_completion_tokens=None, **limit)
+    result = run_session(make_tasks()[0], settings, FaultConfig(), tmp_path, backend_name="openai")
+    assert result["termination"] == termination
+    assert result["totals"]["total_tokens"] == 102000 * expected_calls
+    assert all(call.args[-2:] == (None, None) for call in backend.complete.call_args_list)
+    recorded = [json.loads(line) for line in
+                (Path(result["path"]) / "events.jsonl").read_text().splitlines()]
+    eligibility = [e["decision_eligible"] for e in recorded if e["kind"] == "tool_end"]
+    assert eligibility == [True, False]
+
+
+def test_expired_deadline_is_not_replaced_by_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-placeholder")
+    backend = OpenAIBackend(Settings(model="offline"))
+
+    async def inspect(*args):
+        assert args[-1] == 0
+        return "offline"
+
+    monkeypatch.setattr(backend, "_complete", inspect)
+    assert backend.complete([], [], lambda event: None, 10, 0) == "offline"

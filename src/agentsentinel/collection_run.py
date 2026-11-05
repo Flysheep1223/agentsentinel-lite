@@ -124,7 +124,9 @@ def audit_session(directory, protocol, design, spec):
         if event["kind"] == "tool_end":
             replayed = environment.call(event["tool"], event["arguments"], event["step"])
             assert replayed["response"] == event["response"]
-            assert event["elapsed_ms"] < protocol["settings"]["session_timeout"] * 1000 + 100
+            timeout = protocol["settings"]["session_timeout"]
+            if timeout is not None:
+                assert event["elapsed_ms"] < timeout * 1000 + 100
     verified = environment.verify(result["termination"])
     assert all(result[key] == value for key, value in verified.items())
     assert trajectory["writes"] == environment.writes

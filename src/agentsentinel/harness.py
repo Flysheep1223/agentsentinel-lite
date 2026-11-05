@@ -29,7 +29,7 @@ def run_session(
     experiment_id: str = "", condition_id: str = "", design_hash: str = "",
 ) -> dict:
     started = perf_counter()
-    deadline = started + settings.session_timeout
+    deadline = started + settings.session_timeout if settings.session_timeout is not None else None
     if phase not in {"demo", "pilot", "collection", "online"}:
         raise ValueError("Unknown experiment phase")
     if (observer is None) != (policy_name == "none"):
@@ -83,13 +83,13 @@ def run_session(
 
         record({"kind": "session_start", "session_id": session_id})
         while True:
-            if perf_counter() >= deadline:
+            if deadline is not None and perf_counter() >= deadline:
                 termination = "time_budget"
                 break
             if totals["tool_calls"] >= settings.max_steps:
                 termination = "step_budget"
                 break
-            if totals["total_tokens"] >= settings.max_tokens:
+            if settings.max_tokens is not None and totals["total_tokens"] >= settings.max_tokens:
                 termination = "token_budget"
                 break
             if totals["model_calls"] >= settings.max_model_calls:
@@ -100,8 +100,10 @@ def run_session(
             llm_started = perf_counter()
             try:
                 args = (messages, TOOL_SCHEMAS, record,
-                        settings.max_tokens - totals["total_tokens"])
-                completion = (backend.complete(*args, deadline - perf_counter())
+                        settings.max_tokens - totals["total_tokens"]
+                        if settings.max_tokens is not None else None)
+                remaining_seconds = deadline - perf_counter() if deadline is not None else None
+                completion = (backend.complete(*args, remaining_seconds)
                               if backend_name == "openai" else backend.complete(*args))
             except BackendError as exc:
                 valid = False
@@ -159,7 +161,7 @@ def run_session(
             if missing_usage or invalid_usage:
                 valid, termination = False, "missing_usage" if missing_usage else "invalid_usage"
                 break
-            if perf_counter() >= deadline:
+            if deadline is not None and perf_counter() >= deadline:
                 termination = "time_budget"
                 break
             if completion.finish_reason == "length":
@@ -168,7 +170,7 @@ def run_session(
             if backend_name == "openai" and completion.finish_reason not in {"stop", "tool_calls"}:
                 valid, termination = False, "invalid_finish_reason"
                 break
-            if totals["total_tokens"] >= settings.max_tokens:
+            if settings.max_tokens is not None and totals["total_tokens"] >= settings.max_tokens:
                 termination = "token_budget"
                 break
             if not message.get("tool_calls"):
@@ -180,7 +182,7 @@ def run_session(
                     raise ValueError("Tool arguments must be an object")
             except (json.JSONDecodeError, ValueError):
                 arguments = {"__invalid_json__": call["function"]["arguments"]}
-            if perf_counter() >= deadline:
+            if deadline is not None and perf_counter() >= deadline:
                 termination = "time_budget"
                 break
             totals["tool_calls"] += 1
@@ -191,8 +193,8 @@ def run_session(
             eligible = (
                 totals["tool_calls"] < settings.max_steps
                 and totals["model_calls"] < settings.max_model_calls
-                and totals["total_tokens"] < settings.max_tokens
-                and perf_counter() < deadline
+                and (settings.max_tokens is None or totals["total_tokens"] < settings.max_tokens)
+                and (deadline is None or perf_counter() < deadline)
             )
             event.update({
                 "kind": "tool_end", "step": totals["tool_calls"],
