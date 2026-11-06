@@ -5,10 +5,44 @@
 只用训练分区解释失败、检查特征与选取例子。验证、测试仅经过已有加载器的完整性检查。
 本文记录EDA阶段；后续主实验已完成，完整研究结论见[最终报告](RESEARCH_REPORT_6000_FINAL.md)。
 
-详细产物以 [expanded_eda_v2/report.md](../artifacts/expanded_eda_v2/report.md) 为准。
+基础诊断产物见 [expanded_eda_v2/report.md](../artifacts/expanded_eda_v2/report.md)。
 当前保留v2，初次分析的重复产物已在仓库整理中清除；v2补充了观察训练结果后发现的写入顺序问题，
 将无需写入任务的完成时点修正为初始状态，并细分非预期写入类型。
 这些是探索性诊断，不能包装为预注册的验证结论。原始数据、标签与分区未改写。
+
+## 提案EDA覆盖与报告补充
+
+原v2只有4张图，没有完整覆盖提案第4节的5类可视化要求：缺少故障失败率柱状图、
+Token／耗时／步骤箱线图，以及Spearman相关热图；描述统计和异常值回查的展示也不充分。
+报告定稿时已补充5张图，合计9张，并将统计结果与解释直接写入最终报告第3节。
+这次补充仅分析同一训练分区，发生在模型实验之后，不作为事前发现，也未触发模型或阈值调整。
+
+| 提案要求 | 现有交付与报告位置 |
+| --- | --- |
+| 缺失、重复、异常数值／时间、极端轨迹回查 | 第3.1节；[逐字段质量表](../artifacts/expanded_eda_supplement_v1/missing_and_numeric_quality.csv)、[外点统计](../artifacts/expanded_eda_supplement_v1/tukey_outliers.csv)、[代表性极端轨迹检查](../artifacts/expanded_eda_supplement_v1/extreme_trajectory_checks.json) |
+| 按结果、工作流和条件统计数量、失败率、均值、标准差、中位数与四分位数 | 第3.3、3.7节；[分组数量](../artifacts/expanded_eda_supplement_v1/grouped_counts.csv)、[完整描述统计](../artifacts/expanded_eda_supplement_v1/grouped_descriptive.csv)，含工作流×条件×结果组合 |
+| 故障失败率柱状图，标失败数／总数 | 图1；[分工作流柱状图](./figures/research_report_6000/05_condition_failure.png) |
+| Token、耗时、步骤箱线图，按工作流分面 | 图4—6；[Token](./figures/research_report_6000/06_token_boxplot.png)、[耗时](./figures/research_report_6000/07_time_boxplot.png)、[步骤](./figures/research_report_6000/08_steps_boxplot.png) |
+| 固定步骤错误×重复失败率热图，每格标n | 图7；保留原第3步热图，说明仅2个任务的小样本格 |
+| 前缀趋势及仍可继续的任务数 | 图9；保留原逐步错误曲线与存活人数 |
+| 固定步骤Spearman相关热图 | 图8；[分工作流相关热图](./figures/research_report_6000/09_step3_spearman.png)，常量不记为零相关 |
+| 检验不完整响应与显式报错的恢复差异 | 第3.5节；[恢复对照](../artifacts/expanded_eda_supplement_v1/recovery_comparison.csv)，区分事件恢复率和任务成功率 |
+
+补充得到的主要结果：
+
+- 有效任务资源字段及22项前缀输入均无缺失，数值列没有非有限值或负值，任务／步骤键没有重复。
+  真实发生的4,702次相邻同参重试保留。全部训练尝试有58条完整输入／输出Token与费用缺失、
+  4条推理Token缺失，均不补零。
+- 分组箱线图有62条耗时上侧外点；回查每个工作流×结果组的Token与时间最大值，共6条任务、
+  24个原始文件，用量、时间顺序和哈希均一致。最长任务308.99秒，最多Token为30,661；
+  所有外点保留。服务事件失败组的步数Q1与Q3均为12，下侧外点不能理解为日志错误。
+- 显式读取错误恢复4,031/5,926次（68.02%），其中政策错误恢复1,267/1,838次（68.93%）；
+  不完整政策响应补全590/804次（73.38%）。已恢复事件的间隔中位数分别为1、1、2步。
+  不支持直接声称不完整响应更难恢复；恢复定义、任务构成和剩余观察机会不同，不能作因果比较。
+- 第3步按工作流计算，重试与最近重复比的Spearman相关为0.974／1.000，
+  总Token与费用为0.869／0.932。分组后依然高度相关，不能把单个模型系数解释为独立影响。
+
+补充分析保留独立目录，未覆盖原v2产物及其封印。新增图同时保存PNG与SVG。
 
 ## 主要发现
 
@@ -70,7 +104,7 @@
 另有 15 条 `v2-ticket-08` 任务无需任何写入，初始状态就满足验证，完成时点记为 0。
 此处“完成”始终指写入与状态判定，不代表所有读取指令已经执行。
 
-![成功任务的完成时点](../artifacts/expanded_eda_v2/figures/04_success_completion_step.png)
+![成功任务的完成时点](./figures/research_report_6000/04_success_completion_step.png)
 
 ### 5. 模板差异远大于统一规则能解释的程度
 
@@ -89,7 +123,22 @@
 相差约 3.54 倍。incident 成功/失败 Token 中位数为 14407/24945.5，
 ticket 为 12410/24061.5；这些完整资源差异不能当作早期预测能力。
 
-![训练模板失败组成](../artifacts/expanded_eda_v2/figures/01_failure_composition.png)
+![训练模板失败组成](./figures/research_report_6000/01_failure_composition.png)
+
+![按工作流分面的运行条件失败率](./figures/research_report_6000/05_condition_failure.png)
+
+每根柱标注失败率及失败数／有效任务数。服务事件的部分响应组失败率为45.9%，正常组为38.8%；
+工单对应比例为8.7%与9.0%，说明故障条件需要结合任务结构解释。
+
+![按工作流与最终结果分组的总Token箱线图](./figures/research_report_6000/06_token_boxplot.png)
+
+![按工作流与最终结果分组的耗时箱线图](./figures/research_report_6000/07_time_boxplot.png)
+
+![按工作流与最终结果分组的工具步数箱线图](./figures/research_report_6000/08_steps_boxplot.png)
+
+以上三图均以完整任务为单位，按工作流和最终结果分组，横轴标注样本数。
+箱体为Q1至Q3，中线为中位数，须线延伸至1.5倍四分位距范围内的最远观测，外点全部保留。
+服务事件失败组的工具步数Q1、中位数和Q3均为12，因此箱体收缩为一条线。
 
 ### 6. 第 3 步的简单错误与重复信号有限
 
@@ -104,7 +153,17 @@ ticket 为 12410/24061.5；这些完整资源差异不能当作早期预测能�
 晚期 incident 成功轨迹的错误均值甚至高于失败轨迹，但第 11 步只剩 84 条成功，
 不能把这种存活样本的变化解释为错误有利于成功。
 
-![第3步错误与重复](../artifacts/expanded_eda_v2/figures/03_step3_error_repeat.png)
+![第3步错误与重复](./figures/research_report_6000/03_step3_error_repeat.png)
+
+![第3步运行特征的Spearman相关热图](./figures/research_report_6000/09_step3_spearman.png)
+
+两个分面分别对应1,769条服务事件和1,773条工单任务，每个任务仅贡献一条第3步前缀。
+图示12项错误、重复与资源特征，不纳入最终标签或事后诊断；常量列的相关系数不记作零。
+
+![累计错误趋势与各步骤仍可决策的样本量](./figures/research_report_6000/02_error_trends_survivors.png)
+
+点旁数字为该步仍可决策的任务数。后期留下的成功任务通常更难完成，
+不能把成功曲线后期错误较多解释为报错有利于成功。
 
 ### 7. 批次效应需要与风险信号分开
 
@@ -147,6 +206,19 @@ EDA本身没有训练模型、选择阈值或启动收费采集；后续实验�
 ```
 
 上例 v3 用于复现，已有 v2 不覆盖；源数据迁移后加 `--source`。
+
+报告补充使用独立脚本，输出同样必须是新目录：
+
+```bash
+.venv/bin/python scripts/supplement_training_eda.py \
+  --output artifacts/expanded_eda_supplement_reproduce
+```
+
+脚本仅加载训练观测，验证所读数据表的原封印，并在执行前后核对输入与代表性原始文件哈希。
+全量原始时间戳审计沿用已有审计证据，本次另行检查6条极端轨迹，不声称重做全量采集审计。
+补充产物的[统计口径与检查摘要](../artifacts/expanded_eda_supplement_v1/summary.json)、
+[独立产物清单与输入哈希](../artifacts/expanded_eda_supplement_v1/manifest.json)保留可追溯记录。
+脚本不训练模型、不生成验证／测试预测，也不调用收费接口。
 
 - [完整报告](../artifacts/expanded_eda_v2/report.md)：分类、比例、例子与图。
 - [分析口径](../artifacts/expanded_eda_v2/analysis_plan.json)：运行前记录、探索修订说明、输入封印与代码哈希。
