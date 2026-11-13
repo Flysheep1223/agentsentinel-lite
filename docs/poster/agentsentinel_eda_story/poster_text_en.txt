@@ -1,0 +1,180 @@
+EXPLORATORY DATA ANALYSIS · LLM AGENT RELIABILITY
+
+AgentSentinel-Lite
+
+Tool errors ≠ task failure | Reading risk, recovery and stopping costs from traces
+
+Three proposal research questions · 6,000 real-model runs · training-only EDA · frozen test
+
+6,000
+
+COLLECTED RUNS
+
+5,894
+
+VALID TASKS
+
+47,184
+
+ELIGIBLE PREFIXES
+
+3,542
+
+TRAINING EDA
+
+01 | DESIGN: at step t, predict final failure using only observed events
+
+Completed data and strict split
+
+20 templates × 20 instances × 5 conditions × 3 repeats = 6,000
+Ticket + incident; normal/timeout/rate-limit/schema/partial response
+Train/validation/test = 3,542/1,176/1,176; parent families 6/2/2
+No template or prefix crosses splits; 106 invalid runs audited separately
+
+Prefix prediction, not hindsight
+
+$p_{s,t}=P(Y_s=1 \mid X_{s,\leq t})$
+
+Score after a tool return; use current and past events only.
+Fault settings, future steps and verifier answers are never inputs.
+
+Prediction and stopping are distinct
+
+Errors/retries/repeats, tokens/cost/time, tool and write context
+LR + KNN + fixed rules; validation false-stop budget
+Report recall, timing, savings and success loss together
+No online intervention; every stopping gain is offline replay
+
+02 | EDA: five figures answer the proposal's core questions
+
+TRAIN ONLY: 3,542 valid tasks / 27,367 prefixes; no validation/test EDA. Supplementary figures are post-hoc exploration and did not alter the frozen main experiment; associations are descriptive.
+
+RQ2 · FAULTS AND TASK STRUCTURE
+
+Fault impact depends on workflow
+
+45.9% / 8.7%
+
+Partial response: 45.9% incident vs 8.7% ticket failure. Normal conditions still have 170 failures; template failure spans 0.67%–90.41%. Facet and split by parent family.
+
+RQ1 + RQ2 · RECOVERY AND COMPLETION
+
+Errors recover; success can be late
+
+51.21%
+
+51.21% of successes show explicit errors; 4,031/5,926 read errors recover (68.02%). 77 successes first complete at step 12: an error alone is not a stopping rule.
+
+RQ1 · FULL-RUN VERSUS EARLY RESOURCES
+
+Full-run gaps are not early signals
+
+STEP 3
+
+Full-run token medians separate, but step-3 means do not: incident success/failure 4,277/4,226; ticket 4,246/4,289. Final consumption cannot stand in for early information.
+
+RQ1 · STEP-3 ERRORS × REPETITION
+
+No stable simple threshold
+
+CHECK n
+
+Within incident zero-error cells, repetition coincides with lower failure (15.8% vs 42.8%); one 50% ticket cell has n=2. This does not show repetition is protective.
+
+RQ1 · CROSS-STEP COHORT CHANGE
+
+Later curves contain different tasks
+
+1,003 → 84
+
+Eligible incident successes fall to 84 at step 11 while 705 failures remain. Higher late errors among successes are not beneficial effects; always report surviving n.
+
+EDA SYNTHESIS · FROM FINDINGS TO CONSTRAINTS
+
+EDA sets the modeling rules
+
+Step-3 Spearman: overlapping information
+
+0.981
+
+Retry ↔ repeat
+
+0.884
+
+Tokens ↔ cost
+
+0.894
+
+Tokens ↔ reasoning
+
+Task heterogeneity
+
+→
+
+parent-family CV + family results
+
+Late recovery / completion
+
+→
+
+separate alerts, false stops, success loss
+
+Weak early split / correlation
+
+→
+
+joint features + fixed-step tests + ablation
+
+Quality floor: no missing, negative or non-finite values in valid analysis fields; 62 time and 31 token outliers audited and retained.
+Invalid rates at 50/10 workers: 8.00%/1.03%; date and provider state are confounded.
+
+03 | FROM EDA TO THE FROZEN TEST: risk is predictable; loss-free stopping is not
+
+Frozen model and fair comparison
+
+Prediction is not prevention
+
+Savings are not loss-free gains
+
+22 observable features; at most 6 prefixes/task
+LR C=1; KNN k=9; fixed/step/never-stop rules
+19,094 training prefixes; 3-fold parent-family CV
+5% validation false-stop budget; one frozen test
+
+ROC AUC: all prefixes 0.8413 | step 3 0.7422
+
+83.18%
+
+11.94%
+
+Failure recall 267/321
+
+Pre-violation coverage 32/268
+
+Of 267 failure alerts, 154 occur after first violation; 55 at the same step and 32 before.
+
+9.74%
+
+Estimated cost saved
+
+1.99%
+
+False stops 17/855
+
+−14
+
+Strict successes 855 → 841
+
+Under the same 5% validation budget, KNN and rules select no-stop; the test has only two parent families.
+
+Exploratory 48-feature extension (seen test set, not a new blind test): savings 5.39%→5.83%; false stops 4→3; detections by step 6: 14→60. Strict successes remain below baseline; the frozen conclusion stands.
+
+EDA | Errors are not labels, late gaps are not early signals, and correlation is not causation.
+Study | Runtime signals support risk monitoring and reduce some later waste; violation prevention, loss-free stopping and online gains remain unproven.
+Presentation | Understand failure and recovery first; protect recoverable successes before claiming execution savings.
+
+Proposal: AgentSentinel_Lite_Proposal.md | Results: RESEARCH_REPORT_6000_FINAL.md (6 Nov 2026)
+
+github.com/Flysheep1223/agentsentinel-lite
+
+Real LLM + local simulated tools · EDA figures use training data only · Seedream 5.5 created header decoration only, never study figures or numbers

@@ -1,0 +1,266 @@
+EXPLORATORY DATA ANALYSIS · LLM AGENT RELIABILITY
+
+AgentSentinel-Lite
+
+Failure prediction and early stopping from runtime tool events
+
+COMPLETE STUDY · REAL MODEL TRACES · TRAINING-ONLY EDA · FROZEN TEST · EXTENSION
+
+6,000
+
+COLLECTED RUNS
+
+5,894
+
+VALID TASKS
+
+47,184
+
+ELIGIBLE PREFIXES
+
+3,542
+
+TRAINING EDA
+
+01
+
+Introduction & objectives
+
+Tool errors can recover; normal returns can still violate the task. Using only current and past observable events,
+the study updates final-failure risk after each tool return and evaluates prediction, alert timing, cost and success
+protection together. Can early stopping reduce wasted work without sacrificing recoverable runs? Prediction,
+pre-violation warning and loss-free stopping are distinct objectives, not interchangeable outcomes.
+
+02
+
+Methods / system, data & acceptance
+
+Complete tool
+event traces
+
+Observable
+runtime features
+
+Stepwise failure
+probability
+
+Offline replay
+continue or stop
+
+Real kimi-k3-1-pro-261024 in a LOCAL SIMULATED service desk: ticket and incident read/write workflows.
+20 templates × 20 parameter instances × 5 conditions × 3 repeats = 6,000 runs in 10 parent families.
+Conditions: normal, timeout, rate limit, schema change, partial response; ≤12 tool and ≤24 LLM calls/run.
+Tools, states and faults are programmatic; no risk stopping during collection. Full traces support replay.
+
+Split
+
+Fam./temp.
+
+Valid
+
+Success
+
+Failure
+
+Invalid
+
+Prefixes
+
+Train
+
+6 / 12
+
+3,542
+
+2,570
+
+972
+
+58
+
+27,367
+
+Validation
+
+2 / 4
+
+1,176
+
+997
+
+179
+
+24
+
+10,529
+
+Test
+
+2 / 4
+
+1,176
+
+855
+
+321
+
+24
+
+9,288
+
+Total
+
+10 / 20
+
+5,894
+
+4,422
+
+1,472
+
+106
+
+47,184
+
+Valid-task success: 75.03%. Strict success = required writes + final state + no unexpected/duplicate writes.
+Each session retains session.json, events.jsonl (raw SSE), trajectory.json and result.json; hashes are audited.
+Known collection cost: ¥1,006.602469; 103 requests have unknown cost, never imputed as zero.
+Families never cross splits. Labels, fault metadata, hidden verifier answers and future events are not features.
+
+03
+
+Results / Exploratory Data Analysis (EDA)
+
+TRAIN ONLY: 3,542 valid tasks and 27,367 prefixes; quality adds 58 invalid attempts. No validation/test EDA.
+All 22 features: zero missing, negative or non-finite values; unique ID/step keys; no duplicate rows in 28,202 events.
+4,702 genuine same-argument retries are not log duplicates. 62 time and 31 token outliers audited (6 tasks/24 files), retained.
+
+A | Failure evidence and task heterogeneity (Fig. 1)
+
+The 972 failures partition into violation+missing 411, violation-only 253, missing-only 277 and state-only 31.
+757/972 (77.88%) exhausted 12 steps; 664 contained violations (overlapping evidence). All 31 state failures were order errors.
+Template failure spans 0.67%–90.41%; two incident families contribute 67.70%. Random prefix splits would leak structure.
+
+B | Assigned condition × workflow (Fig. 2)
+
+Normal conditions still produced 170 failures, 159 with violations; faults are not necessary for failure.
+Partial-response failure: incident 45.9% vs ticket 8.7%. Budget failures form 91.74%/94.47% of rate-limit/timeout failures.
+Conditions are assigned, not guaranteed triggers. These are descriptive strata, not a universal causal hazard ranking.
+
+C | Large full-run resource gaps, weak early separation (Fig. 3)
+
+Median tokens, success/failure: incident 14,407/24,945.5; ticket 12,410/24,061.5.
+Median seconds: 67.37/92.61 and 56.90/86.52; median tool steps: 7/12 and 6/12.
+Yet step-3 token means span only 4,226–4,289 across four groups, before any applied violation.
+Full-trajectory gaps do not prove early separability. Condition rankings differ across tokens, steps and time.
+
+03
+
+Results / EDA (continued)
+
+D | Error recovery and completion timing (Fig. 4)
+
+Among 2,570 successes, 1,316 (51.21%) had explicit tool errors and 548 (21.32%) had ≥3 errors.
+Read errors recovered in 4,031/5,926 events (68.02%; median 1 step); incomplete policies completed in 590/804 (73.38%; 2 steps).
+Recovery means a later same-tool/same-argument normal return or completed fields—not task success; follow-up is budget-limited.
+77 successes first completed at step 12; 80 eventual failures once completed, then deteriorated after extra writes.
+
+E | Early thresholds and correlation structure (Fig. 5)
+
+Step-3 error × repetition has no consistent monotonic relation: incident 0-error/0-repeat failure is 42.8%,
+versus 15.8% with repetition; a 50% ticket cell has n=2. This does not show repetition is protective.
+Spearman: retry/repetition 0.981; tokens/cost 0.884; tokens/reasoning 0.894; output/reasoning 0.999/0.998 by workflow.
+Undefined constant-column correlations are not zero. Correlated coefficients are not independent causal effects.
+
+F | Cross-step trends, survivors and batch confounding (Fig. 6)
+
+Eligible incident successes fall from 1,003 early to 84 at step 11, while 705 failures remain: populations change.
+Report surviving n and common cohorts; do not confuse survivor composition with new information or monotonic gains.
+Invalid rates at 50/10 workers are 8.00%/1.03%, confounded by date, restart phase and provider state; simulated timeout ≠ network wait.
+
+04
+
+Prediction & intervention / frozen main experiment
+
+22 observable features: progress/writes, errors/retries, tokens/cost, time, recent window and tool context; LR C=1, unweighted.
+At most 6 evenly spaced prefixes/task give 19,094 fit rows; three-fold parent-family CV; fold-only preprocessing.
+KNN k=9 distance-weighted; fixed-OR, step and never-stop baselines. Validation selects lowest cost within a 5% false-stop budget.
+Main probability threshold: 0.7380596938. Scoring follows tool return; it cannot undo the just-completed write.
+
+Model
+
+AP
+
+Task-wt AP
+
+ROC AUC
+
+Brier
+
+Step-3 AUC
+
+LR
+
+0.8030
+
+0.7538
+
+0.8413
+
+0.1395
+
+0.7422
+
+KNN
+
+0.7295
+
+0.6774
+
+0.7749
+
+0.1702
+
+0.6099
+
+83.18%
+
+Failure recall 267/321
+
+9.74%
+
+Offline cost saved
+
+−14
+
+Net successes 855→841
+
+Held-out test: 1,176 tasks/9,288 prefixes; 17/855 false stops (1.99%); cost ¥206.20→¥186.11.
+Strict replay: 855−17+3=841. Alerts average 3.82 steps early: 32 before, 55 same-step, 154 after violation, 26 without.
+True pre-violation coverage is 32/268=11.94%, not the 83.18% failure recall. At 5%, KNN/rules select no-stop.
+Stage-only saves 6.96%; removing write count saves 5.37% with net +2 successes (secondary ablation, not a new main model).
+All 17 false stops and nearly all savings concentrate in incidents. Two test families limit generalization; AUC ≠ intervention value.
+
+Exploratory extension / 48 features, seen test set
+
+Adds same-argument history, call sequences, recovery and public response completeness; task-weighted fitting. Comparator C=10; 48-feature C=0.1.
+Shared auxiliary LR predicts current completion; two Ridge heads predict remaining cost/tokens, never main-LR inputs. Rule: ≥90% for 2 steps.
+False stops 4→3; savings 5.39%→5.83%; recall stays 237/321; detections by step 6 rise 14→60; replay 851→852 (<855).
+Validation step-6 AUC 0.80856→0.86201, but step-3 Brier 0.12525→0.15199; test full-prefix task-weighted AUC 0.83404→0.82522.
+Case: zero explicit errors but incomplete policies; stopped at step 8, original succeeds at step 12. Temporary information lack remains ambiguous.
+This reuses an already seen test set: exploratory reevaluation, not a new independent blind test or universal improvement.
+
+05
+
+Discussion, conclusion & limitations
+
+Conclusion: runtime signals support risk monitoring and reduce some later waste.
+Loss-free stopping, violation prevention and online gains remain unproven. Limits: one LLM, two simulated workflows;
+six train/two test families; acceptance omits reading adequacy/final-reply quality; all outcomes are offline replay.
+Next: independent families, preregistered protection, richer acceptance, warnings/deferred decisions/completion detection.
+
+Source: RESEARCH_REPORT_6000_FINAL.md (6 Nov 2026) | ReliabilityBench arXiv:2601.06112; AgentRx arXiv:2602.02475
+
+github.com/Flysheep1223/agentsentinel-lite
+
+EDA uses training only · All stopping gains are offline estimates · Seedream 5.5 created only the conceptual header art, never study figures or numbers
